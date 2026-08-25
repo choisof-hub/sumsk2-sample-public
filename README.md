@@ -212,7 +212,9 @@ SharePoint上のExcelを共通の一覧表として使用し、出荷済みの�
 * 対象日付・時間帯の指定
 * 届け先選択画面を開く
 
-![SUMSK2 メイン画面（公開用サンプル）](images/SUMSK2_初期画面_サンプル.png)
+<img src="./images/SUMSK2_初期画面_サンプル.png"
+     alt="SUMSK2 メイン画面（公開用サンプル）"
+     width="600">
 
 ### 2. 届け先選択画面
 
