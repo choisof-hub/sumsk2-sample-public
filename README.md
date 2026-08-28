@@ -295,6 +295,10 @@ SharePoint上のExcelを共通の一覧表として使用し、出荷済みの�
 
 ```text
 .
+├─ data/
+│  ├─ sales_data.xlsx
+│  ├─ shipment_detail.xlsx
+│  └─ shelf_master.xlsx
 ├─ images/
 │  ├─ SUMSK2_初期画面_サンプル.png
 │  ├─ SUMSK2_商品選択_サンプル.jpg
@@ -305,6 +309,8 @@ SharePoint上のExcelを共通の一覧表として使用し、出荷済みの�
 ├─ file_utils.py
 ├─ requirements.txt
 └─ README.md
+
+なお、同梱サンプルは 2026/04/20、09:00 のデータです。
 ```
 
 ---
