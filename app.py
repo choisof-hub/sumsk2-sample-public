@@ -2,14 +2,80 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import sqlite3
 import pandas as pd
+from pathlib import Path
 
-from import_shipment import import_shipment_data
 from import_sales import import_sales_data
-from file_utils import ensure_data_dir, get_db_path, export_dataframe_to_excel
-
+from file_utils import ensure_data_dir, get_db_path, export_dataframe_to_excel, get_sample_file_path
 
 APP_TITLE = "出荷合計情報ツール（公開用サンプル）"
 APP_VERSION = "v1.6"
+
+
+def import_shipment_data(db_path: str) -> int:
+    """公開用出荷明細と棚番マスターを取り込む。"""
+    shipment_path = get_sample_file_path("shipment_detail.xlsx")
+    shelf_path = get_sample_file_path("shelf_master.xlsx")
+
+    if not shipment_path.exists():
+        raise FileNotFoundError(f"Sample file not found: {shipment_path}")
+
+    df = pd.read_excel(shipment_path)
+    rename_map = {
+        "納品先コード": "customer_code",
+        "納品先名称": "customer_name",
+        "納品先略称": "customer_name",
+        "品目コード": "item_code",
+        "規格": "item_name",
+        "品目略称": "item_name",
+        "出荷数量": "shipping_qty",
+        "相手先注文番号": "order_no",
+        "出荷伝票番号": "shipment_no",
+        "行番号": "line_no",
+        "作成日付": "created_date",
+        "作成時間": "created_time",
+    }
+    df = df.rename(columns={key: value for key, value in rename_map.items() if key in df.columns})
+
+    defaults = {
+        "customer_code": 0, "customer_name": "Sample Customer", "item_code": "ITEM-000",
+        "item_name": "Sample Item", "shipping_qty": 0, "order_no": "ORDER-000",
+        "shipment_no": "SHIP-000", "line_no": 1, "created_date": 19000101, "created_time": 0,
+    }
+    for column, value in defaults.items():
+        if column not in df.columns:
+            df[column] = value
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("BEGIN TRANSACTION")
+        connection.execute("DROP TABLE IF EXISTS shipment_detail_temp")
+        df.to_sql("shipment_detail_temp", connection, if_exists="replace", index=False)
+        connection.execute("ALTER TABLE shipment_detail_temp ADD COLUMN shelf_no TEXT")
+
+        if shelf_path.exists():
+            shelf_df = pd.read_excel(shelf_path).rename(columns={"品目コード": "item_code", "棚番": "shelf_no"})
+            if {"item_code", "shelf_no"}.issubset(shelf_df.columns):
+                connection.execute("DROP TABLE IF EXISTS shelf_master_temp")
+                shelf_df.to_sql("shelf_master_temp", connection, if_exists="replace", index=False)
+                connection.execute("""
+                    UPDATE shipment_detail_temp
+                    SET shelf_no = (
+                        SELECT shelf_master_temp.shelf_no
+                        FROM shelf_master_temp
+                        WHERE shipment_detail_temp.item_code = shelf_master_temp.item_code
+                    )
+                    WHERE EXISTS (
+                        SELECT 1 FROM shelf_master_temp
+                        WHERE shipment_detail_temp.item_code = shelf_master_temp.item_code
+                    )
+                """)
+        connection.commit()
+        return 0
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 class ShippingSummaryApp(tk.Tk):
@@ -17,7 +83,7 @@ class ShippingSummaryApp(tk.Tk):
         super().__init__()
 
         self.title(f"{APP_TITLE} {APP_VERSION}")
-        self.geometry("620x260")
+        self.geometry("620x420")
         self.resizable(False, False)
 
         ensure_data_dir()
@@ -30,9 +96,9 @@ class ShippingSummaryApp(tk.Tk):
     # =========================================================
     def to_japanese_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         rename_map = {
-            "customer_code": "届け先コード",
-            "customer_name": "届け先名称",
-            "row_count": "枚数",
+            "customer_code": "納品先コード",
+            "customer_name": "納品先名称",
+            "row_count": "伝票枚数",
             "item_code": "品目コード",
             "item_name": "品名",
             "order_no": "注文番号",
@@ -53,78 +119,73 @@ class ShippingSummaryApp(tk.Tk):
     # メイン画面
     # =========================================================
     def _build_main_ui(self):
-        title = tk.Label(self, text="出荷合計情報ツール", font=("Yu Gothic UI", 18, "bold"))
+        title = tk.Label(self, text="初期メニュー", font=("Yu Gothic UI", 18, "bold"))
         title.pack(pady=(15, 10))
+
+        btn_frame = tk.Frame(self)
+        btn_frame.pack()
+
+        tk.Button(
+            btn_frame, text="出荷明細取込", width=25, font=("Yu Gothic UI", 12),
+            command=self.load_shipment_data
+        ).grid(row=0, column=0, pady=2)
+
+        tk.Button(
+            btn_frame, text="URIAGEファイル取込", width=25, font=("Yu Gothic UI", 12),
+            command=self.load_sales_data
+        ).grid(row=1, column=0, pady=2)
 
         filter_frame = tk.Frame(self)
         filter_frame.pack(pady=5)
 
         today = pd.Timestamp.today()
 
-        tk.Label(filter_frame, text="年月日", font=("Yu Gothic UI", 10)).grid(row=0, column=0, padx=5, pady=5)
-
-        self.cmb_year = ttk.Combobox(filter_frame, width=8, state="readonly")
+        tk.Label(filter_frame, text="年月日：", font=("Yu Gothic UI", 12)).grid(row=0, column=0, padx=5, pady=2, sticky="e")
+        self.cmb_year = ttk.Combobox(filter_frame, width=6, state="readonly", font=("Yu Gothic UI", 12))
         self.cmb_year["values"] = [str(y) for y in range(today.year - 2, today.year + 2)]
         self.cmb_year.set(str(today.year))
         self.cmb_year.grid(row=0, column=1, padx=2)
-
-        self.cmb_month = ttk.Combobox(filter_frame, width=5, state="readonly")
-        self.cmb_month["values"] = [f"{m:02d}" for m in range(1, 13)]
-        self.cmb_month.set(f"{today.month:02d}")
+        self.cmb_month = ttk.Combobox(filter_frame, width=3, state="readonly", font=("Yu Gothic UI", 12))
+        self.cmb_month["values"] = [f"{m}" for m in range(1, 13)]
+        self.cmb_month.set(f"{today.month}")
         self.cmb_month.grid(row=0, column=2, padx=2)
-
-        self.cmb_day = ttk.Combobox(filter_frame, width=5, state="readonly")
-        self.cmb_day["values"] = [f"{d:02d}" for d in range(1, 32)]
-        self.cmb_day.set(f"{today.day:02d}")
+        self.cmb_day = ttk.Combobox(filter_frame, width=3, state="readonly", font=("Yu Gothic UI", 12))
+        self.cmb_day["values"] = [f"{d}" for d in range(1, 32)]
+        self.cmb_day.set(f"{today.day}")
         self.cmb_day.grid(row=0, column=3, padx=2)
 
-        tk.Label(filter_frame, text="From", font=("Yu Gothic UI", 10)).grid(row=1, column=0, padx=5, pady=5)
-
-        self.cmb_from_h = ttk.Combobox(filter_frame, width=5, state="readonly")
-        self.cmb_from_h["values"] = [f"{h:02d}" for h in range(24)]
-        self.cmb_from_h.set("00")
+        tk.Label(filter_frame, text="From時間：", font=("Yu Gothic UI", 12)).grid(row=1, column=0, padx=5, pady=2, sticky="e")
+        self.cmb_from_h = ttk.Combobox(filter_frame, width=3, state="readonly", font=("Yu Gothic UI", 12))
+        self.cmb_from_h["values"] = [f"{h}" for h in range(24)]
+        self.cmb_from_h.set("8")
         self.cmb_from_h.grid(row=1, column=1, padx=2)
-
-        self.cmb_from_m = ttk.Combobox(filter_frame, width=5, state="readonly")
-        self.cmb_from_m["values"] = [f"{m:02d}" for m in range(0, 60, 5)]
-        self.cmb_from_m.set("00")
+        self.cmb_from_m = ttk.Combobox(filter_frame, width=3, state="readonly", font=("Yu Gothic UI", 12))
+        self.cmb_from_m["values"] = [f"{m}" for m in range(0, 60, 5)]
+        self.cmb_from_m.set("0")
         self.cmb_from_m.grid(row=1, column=2, padx=2)
 
-        tk.Label(filter_frame, text="To", font=("Yu Gothic UI", 10)).grid(row=1, column=3, padx=10, pady=5)
+        tk.Label(filter_frame, text="To時間：", font=("Yu Gothic UI", 12)).grid(row=2, column=0, padx=5, pady=2, sticky="e")
+        self.cmb_to_h = ttk.Combobox(filter_frame, width=3, state="readonly", font=("Yu Gothic UI", 12))
+        self.cmb_to_h["values"] = [f"{h}" for h in range(24)]
+        self.cmb_to_h.set("18")
+        self.cmb_to_h.grid(row=2, column=1, padx=2)
+        self.cmb_to_m = ttk.Combobox(filter_frame, width=3, state="readonly", font=("Yu Gothic UI", 12))
+        self.cmb_to_m["values"] = [f"{m}" for m in range(0, 60, 5)]
+        self.cmb_to_m.set("0")
+        self.cmb_to_m.grid(row=2, column=2, padx=2)
 
-        self.cmb_to_h = ttk.Combobox(filter_frame, width=5, state="readonly")
-        self.cmb_to_h["values"] = [f"{h:02d}" for h in range(24)]
-        self.cmb_to_h.set("23")
-        self.cmb_to_h.grid(row=1, column=4, padx=2)
-
-        self.cmb_to_m = ttk.Combobox(filter_frame, width=5, state="readonly")
-        self.cmb_to_m["values"] = [f"{m:02d}" for m in range(0, 60, 5)]
-        self.cmb_to_m.set("55")
-        self.cmb_to_m.grid(row=1, column=5, padx=2)
-
-        btn_frame = tk.Frame(self)
-        btn_frame.pack(pady=20)
+        bottom_btn_frame = tk.Frame(self)
+        bottom_btn_frame.pack()
 
         tk.Button(
-            btn_frame, text="出荷明細データ取込", width=18,
-            command=self.load_shipment_data
-        ).grid(row=0, column=0, padx=8, pady=5)
-
-        tk.Button(
-            btn_frame, text="売上データ取込", width=18,
-            command=self.load_sales_data
-        ).grid(row=0, column=1, padx=8, pady=5)
-
-        tk.Button(
-            btn_frame, text="届け先選択画面",
-            width=18,
+            bottom_btn_frame, text="納品先選択画面", width=25, font=("Yu Gothic UI", 12),
             command=self.open_customer_window
-        ).grid(row=1, column=0, padx=8, pady=5)
+        ).grid(row=0, column=0, pady=2)
 
         tk.Button(
-            btn_frame, text="終了", width=18, fg="red",
+            bottom_btn_frame, text="終了", width=25, fg="red", font=("Yu Gothic UI", 12),
             command=self.destroy
-        ).grid(row=1, column=1, padx=8, pady=5)
+        ).grid(row=1, column=0, pady=2)
 
     # =========================================================
     # 日付・時間条件
@@ -162,11 +223,11 @@ class ShippingSummaryApp(tk.Tk):
     # =========================================================
     def create_summary_sql(self, by_order=False):
         if by_order:
-            # サンプルExcel完全一致：注番は「注番・品目コード・枚数・個数」のみ
             sql = """
                 SELECT
                     order_no,
                     item_code,
+                    item_name,
                     COUNT(item_code) AS sheet_count,
                     SUM(shipping_qty) AS total_qty
                 FROM shipment_detail_temp
@@ -174,14 +235,14 @@ class ShippingSummaryApp(tk.Tk):
                   AND created_date = ?
                   AND created_time >= ?
                   AND created_time <= ?
-                GROUP BY order_no, item_code
+                GROUP BY order_no, item_code, item_name
                 ORDER BY order_no ASC, item_code ASC
             """
         else:
-            # サンプルExcel完全一致：標準は「品目コード・枚数・個数」のみ
             sql = """
                 SELECT
                     item_code,
+                    item_name,
                     COUNT(item_code) AS sheet_count,
                     SUM(shipping_qty) AS total_qty
                 FROM shipment_detail_temp
@@ -189,7 +250,7 @@ class ShippingSummaryApp(tk.Tk):
                   AND created_date = ?
                   AND created_time >= ?
                   AND created_time <= ?
-                GROUP BY item_code
+                GROUP BY item_code, item_name
                 ORDER BY item_code ASC
             """
         return sql
@@ -229,8 +290,7 @@ class ShippingSummaryApp(tk.Tk):
         return sql
 
     # =========================================================
-    # 届け先選択画面
-    # サンプル画面完全一致：届け先名称・枚数（届け先コードは表示しない）
+    # 納品先選択画面
     # =========================================================
     def open_customer_window(self):
         try:
@@ -238,15 +298,11 @@ class ShippingSummaryApp(tk.Tk):
             df = pd.read_sql_query(
                 self.create_customer_list_sql(),
                 conn,
-                params=(
-                    self.get_search_day(),
-                    self.get_from_time(),
-                    self.get_to_time(),
-                ),
+                params=(self.get_search_day(), self.get_from_time(), self.get_to_time()),
             )
             conn.close()
         except Exception as e:
-            messagebox.showerror("エラー", f"届け先一覧の表示に失敗しました。\n{e}")
+            messagebox.showerror("エラー", f"納品先一覧の表示に失敗しました。\n{e}")
             return
 
         if df.empty:
@@ -254,48 +310,45 @@ class ShippingSummaryApp(tk.Tk):
             return
 
         win = tk.Toplevel(self)
-        win.title("届け先選択")
-        win.geometry("760x540")
+        win.title("納品先選択")
+        win.geometry("820x650")
 
-        lbl = tk.Label(win, text="届け先選択画面", font=("Yu Gothic UI", 16, "bold"))
+        lbl = tk.Label(win, text="納品先選択画面", font=("Yu Gothic UI", 16, "bold"))
         lbl.pack(pady=8)
 
-        # 表示は2列のみ（サンプル画面完全一致）
         columns = ("customer_name", "row_count")
-        tree = ttk.Treeview(win, columns=columns, show="headings", height=20)
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        tree.heading("customer_name", text="届け先名称")
-        tree.heading("row_count", text="枚数")
+        tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=20)
+
+        tree.heading("customer_name", text="納品先名称")
+        tree.heading("row_count", text="伝票枚数")
 
         tree.column("customer_name", width=620)
         tree.column("row_count", width=100, anchor=tk.E)
 
-        # 内部処理用に customer_code は iid に保持
         for _, row in df.iterrows():
-            tree.insert(
-                "", "end",
-                iid=str(row["customer_code"]),
-                values=(row["customer_name"], row["row_count"])
-            )
+            tree.insert("", "end", iid=str(row["customer_code"]), values=(row["customer_name"], row["row_count"]))
 
-        vsb = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
 
-        tree.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
-        vsb.pack(side="right", fill="y", pady=10)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
 
         btn_frame = tk.Frame(win)
         btn_frame.pack(pady=10)
 
-        tk.Button(btn_frame, text="選択（標準）", width=16, command=lambda: self.open_standard_summary(tree)).grid(row=0, column=0, padx=5)
-        tk.Button(btn_frame, text="選択（注番）", width=16, command=lambda: self.open_order_summary(tree)).grid(row=0, column=1, padx=5)
-        tk.Button(btn_frame, text="明細出力", width=16, command=lambda: self.export_detail(tree)).grid(row=0, column=2, padx=5)
-        tk.Button(btn_frame, text="終了", width=16, fg="red", command=win.destroy).grid(row=0, column=3, padx=5)
+        tk.Button(btn_frame, text="選択（標準）", width=16, font=("Yu Gothic UI", 12), command=lambda: self.open_standard_summary(tree)).grid(row=0, column=0, padx=5)
+        tk.Button(btn_frame, text="選択（注番）", width=16, font=("Yu Gothic UI", 12), command=lambda: self.open_order_summary(tree)).grid(row=0, column=1, padx=5)
+        tk.Button(btn_frame, text="明細出力", width=16, font=("Yu Gothic UI", 12), command=lambda: self.export_detail(tree)).grid(row=0, column=2, padx=5)
+        tk.Button(btn_frame, text="終了", width=16, fg="red", font=("Yu Gothic UI", 12), command=win.destroy).grid(row=0, column=3, padx=5)
 
     def get_selected_customer(self, tree):
         selected = tree.selection()
         if not selected:
-            messagebox.showwarning("確認", "届け先を選択してください。")
+            messagebox.showwarning("確認", "納品先を選択してください。")
             return None, None
 
         item_id = selected[0]
@@ -308,7 +361,6 @@ class ShippingSummaryApp(tk.Tk):
 
     # =========================================================
     # 合計出荷情報（標準）
-    # サンプルExcel完全一致：品目コード・枚数・個数
     # =========================================================
     def open_standard_summary(self, tree):
         customer_code, customer_name = self.get_selected_customer(tree)
@@ -333,40 +385,44 @@ class ShippingSummaryApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("合計出荷情報（標準）")
-        win.geometry("950x540")
+        win.geometry("950x650")
 
         lbl = tk.Label(win, text=str(customer_name), font=("Yu Gothic UI", 16, "bold"))
         lbl.pack(pady=8)
 
-        columns = ("item_code", "sheet_count", "total_qty")
-        tree2 = ttk.Treeview(win, columns=columns, show="headings", height=20)
+        columns = ("item_code", "item_name", "sheet_count", "total_qty")
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tree2 = ttk.Treeview(list_frame, columns=columns, show="headings", height=20)
 
         tree2.heading("item_code", text="品目コード")
+        tree2.heading("item_name", text="品名")
         tree2.heading("sheet_count", text="枚数")
         tree2.heading("total_qty", text="個数")
 
-        tree2.column("item_code", width=700)
+        tree2.column("item_code", width=150)
+        tree2.column("item_name", width=550)
         tree2.column("sheet_count", width=100, anchor=tk.E)
         tree2.column("total_qty", width=100, anchor=tk.E)
 
         for _, row in df.iterrows():
-            tree2.insert("", "end", values=(row["item_code"], row["sheet_count"], row["total_qty"]))
+            tree2.insert("", "end", values=(row["item_code"], row["item_name"], row["sheet_count"], row["total_qty"]))
 
-        vsb = ttk.Scrollbar(win, orient="vertical", command=tree2.yview)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree2.yview)
         tree2.configure(yscrollcommand=vsb.set)
 
-        tree2.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
-        vsb.pack(side="right", fill="y", pady=10)
+        tree2.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
 
         btn_frame = tk.Frame(win)
         btn_frame.pack(pady=10)
 
         tk.Button(
-            btn_frame, text="EXCEL出力", width=18,
+            btn_frame, text="EXCEL出力", width=18, font=("Yu Gothic UI", 12),
             command=lambda: self.export_standard_summary(customer_code, customer_name)
         ).grid(row=0, column=0, padx=5)
 
-        tk.Button(btn_frame, text="終了", width=18, fg="red", command=win.destroy).grid(row=0, column=1, padx=5)
+        tk.Button(btn_frame, text="終了", width=18, fg="red", font=("Yu Gothic UI", 12), command=win.destroy).grid(row=0, column=1, padx=5)
 
     def export_standard_summary(self, customer_code, customer_name):
         try:
@@ -382,7 +438,7 @@ class ShippingSummaryApp(tk.Tk):
                 messagebox.showinfo("確認", "出力対象データがありません。")
                 return
 
-            df = df[["item_code", "sheet_count", "total_qty"]]
+            df = df[["item_code", "item_name", "sheet_count", "total_qty"]]
             df = self.to_japanese_columns(df)
 
             output_path = export_dataframe_to_excel(df, f"{customer_name}_出荷合計数（標準）.xlsx")
@@ -392,7 +448,6 @@ class ShippingSummaryApp(tk.Tk):
 
     # =========================================================
     # 合計出荷情報（注番）
-    # サンプルExcel完全一致：注番・品目コード・枚数・個数
     # =========================================================
     def open_order_summary(self, tree):
         customer_code, customer_name = self.get_selected_customer(tree)
@@ -417,42 +472,46 @@ class ShippingSummaryApp(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("合計出荷情報（注番）")
-        win.geometry("950x540")
+        win.geometry("950x650")
 
         lbl = tk.Label(win, text=str(customer_name), font=("Yu Gothic UI", 16, "bold"))
         lbl.pack(pady=8)
 
-        columns = ("order_no", "item_code", "sheet_count", "total_qty")
-        tree2 = ttk.Treeview(win, columns=columns, show="headings", height=20)
+        columns = ("order_no", "item_code", "item_name", "sheet_count", "total_qty")
+        list_frame = tk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        tree2 = ttk.Treeview(list_frame, columns=columns, show="headings", height=20)
 
         tree2.heading("order_no", text="注番")
         tree2.heading("item_code", text="品目コード")
+        tree2.heading("item_name", text="品名")
         tree2.heading("sheet_count", text="枚数")
         tree2.heading("total_qty", text="個数")
 
-        tree2.column("order_no", width=200)
-        tree2.column("item_code", width=550)
+        tree2.column("order_no", width=150)
+        tree2.column("item_code", width=150)
+        tree2.column("item_name", width=400)
         tree2.column("sheet_count", width=100, anchor=tk.E)
         tree2.column("total_qty", width=100, anchor=tk.E)
 
         for _, row in df.iterrows():
-            tree2.insert("", "end", values=(row["order_no"], row["item_code"], row["sheet_count"], row["total_qty"]))
+            tree2.insert("", "end", values=(row["order_no"], row["item_code"], row["item_name"], row["sheet_count"], row["total_qty"]))
 
-        vsb = ttk.Scrollbar(win, orient="vertical", command=tree2.yview)
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree2.yview)
         tree2.configure(yscrollcommand=vsb.set)
 
-        tree2.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
-        vsb.pack(side="right", fill="y", pady=10)
+        tree2.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
 
         btn_frame = tk.Frame(win)
         btn_frame.pack(pady=10)
 
         tk.Button(
-            btn_frame, text="EXCEL出力", width=18,
+            btn_frame, text="EXCEL出力", width=18, font=("Yu Gothic UI", 12),
             command=lambda: self.export_order_summary(customer_code, customer_name)
         ).grid(row=0, column=0, padx=5)
 
-        tk.Button(btn_frame, text="終了", width=18, fg="red", command=win.destroy).grid(row=0, column=1, padx=5)
+        tk.Button(btn_frame, text="終了", width=18, fg="red", font=("Yu Gothic UI", 12), command=win.destroy).grid(row=0, column=1, padx=5)
 
     def export_order_summary(self, customer_code, customer_name):
         try:
@@ -468,7 +527,7 @@ class ShippingSummaryApp(tk.Tk):
                 messagebox.showinfo("確認", "出力対象データがありません。")
                 return
 
-            df = df[["order_no", "item_code", "sheet_count", "total_qty"]]
+            df = df[["order_no", "item_code", "item_name", "sheet_count", "total_qty"]]
             df = df.rename(columns={"order_no": "注番"})
             df = self.to_japanese_columns(df)
 
@@ -498,7 +557,6 @@ class ShippingSummaryApp(tk.Tk):
                 messagebox.showinfo("確認", "明細データがありません。")
                 return
 
-            # 品目コード単位でGRPを付与（公開用サンプル）
             df["group_mark"] = ""
             current_mark = "■"
 
@@ -517,7 +575,6 @@ class ShippingSummaryApp(tk.Tk):
 
         except Exception as e:
             messagebox.showerror("エラー", f"明細データのEXCEL出力に失敗しました。\n{e}")
-
 
 if __name__ == "__main__":
     app = ShippingSummaryApp()
